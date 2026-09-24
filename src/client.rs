@@ -14,7 +14,9 @@ use {
 };
 
 /// Maximum transaction payload (Solana packet size).
-pub(crate) const MAX_TX_BYTES: usize = 1232;
+/// Largest transaction the ingress accepts: the v1 (SIMD-0385) limit. The library has
+/// no Solana dependency, so this mirrors `solana_message::v1::MAX_TRANSACTION_SIZE`.
+pub(crate) const MAX_TX_BYTES: usize = 4096;
 /// Hard cap on token length (mirror of the server's handshake limit).
 const MAX_TOKEN_BYTES: usize = 200;
 /// Handshake line prefix (note the trailing space).

@@ -5,7 +5,7 @@ Rust client for the Solana Gun QUIC transaction-submission ingress. Token-authen
 ## What it does
 
 - Opens a single QUIC connection to the ingress endpoint authenticated by a bearer token at handshake time.
-- Sends serialized Solana `VersionedTransaction` bytes over short-lived uni-streams (one transaction per stream, ≤1232 bytes).
+- Sends serialized Solana `VersionedTransaction` bytes over short-lived uni-streams (one transaction per stream, ≤4096 bytes — the v1 transaction limit).
 - Keeps the connection alive between transactions; no per-transaction handshake.
 - Re-dials automatically when the connection drops and replays the failed send, with bounded jittered backoff.
 - Surfaces authentication errors immediately so a stale token never silently retries forever.
@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ClientConfig::default();
     let client = SolanaGunQuicClient::connect("fra1.solanagun.com:7000", "my-token", config).await?;
 
-    let tx_bytes: Vec<u8> = bincode::serialize(&my_transaction)?;
+    let tx_bytes: Vec<u8> = wincode::serialize(&my_transaction)?;
     client.send_transaction_bytes(&tx_bytes).await?;
 
     client.close().await;
@@ -41,7 +41,7 @@ cargo run --release --example send
 
 ## Full transfer example
 
-`examples/transfer.rs` is a self-contained end-to-end demo: it loads your Solana keypair, fetches a recent blockhash, builds a v0 `VersionedTransaction` with two `SystemProgram::Transfer` instructions (recipient + tip), bincode-serializes it, and submits it over the QUIC ingress. The Solana Gun production tip addresses are pre-filled; pick one via `TIP_INDEX`.
+`examples/transfer.rs` is a self-contained end-to-end demo: it loads your Solana keypair, fetches a recent blockhash, builds a v0 `VersionedTransaction` with two `SystemProgram::Transfer` instructions (recipient + tip), serializes it with `wincode` (byte-identical to bincode for legacy/v0, and the only codec that encodes v1), and submits it over the QUIC ingress. The Solana Gun production tip addresses are pre-filled; pick one via `TIP_INDEX`.
 
 Edit the constants at the top of the file (`HOST`, `TOKEN`, `RECIPIENT`, `AMOUNT_LAMPORTS`, `TIP_INDEX`, `TIP_LAMPORTS`, `KEYPAIR_PATH`, `RPC_URL`) and run:
 
@@ -99,7 +99,7 @@ A **stream-level** reset by the server (close code `0x10`, used for per-tx backp
 | ALPN | `solana-gun-ingress/1` |
 | TLS | 1.3 only, server cert validated against system roots + hostname (WebPKI) |
 | Handshake | bidi stream: client sends `SOLANA-GUN-QUIC/1 <token>\n`, server replies `OK\n` then closes |
-| Submission | one uni-stream per transaction, ≤ 1232 bytes (Solana packet size) |
+| Submission | one uni-stream per transaction, ≤ 4096 bytes (v1 transaction limit) |
 | Server response | none (fire-and-forget) |
 | Close codes | `0x01` unauthorized · `0x02` bad request · `0x03` too many connections · `0x04` revoked |
 | Stream reset code | `0x10` (backpressure / oversized / decode failure) |

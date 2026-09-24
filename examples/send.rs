@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ClientConfig::default();
     let client = SolanaGunQuicClient::connect(&host, &token, config).await?;
     for i in 0..count {
-        // Dummy 64-byte payload (real callers send bincode VersionedTransaction bytes).
+        // Dummy 64-byte payload (real callers send wincode-serialized VersionedTransaction bytes).
         client.send_transaction_bytes(&[0u8; 64]).await?;
         println!("sent {}", i + 1);
     }

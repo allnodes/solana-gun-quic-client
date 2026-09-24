@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
         .context("compiling v0 message")?;
     let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&payer])
         .context("signing transaction")?;
-    let tx_bytes = bincode::serialize(&tx).context("bincode-serializing transaction")?;
+    let tx_bytes = wincode::serialize(&tx).context("serializing transaction")?;
     let signature = tx.signatures[0];
 
     // ── Pre-flight summary ───────────────────────────────────────
