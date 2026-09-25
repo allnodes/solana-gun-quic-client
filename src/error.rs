@@ -1,4 +1,4 @@
-use thiserror::Error;
+use {crate::autoconfig::FallbackReason, std::fmt, thiserror::Error};
 
 /// Connection-establishment failures.
 #[non_exhaustive]
@@ -18,6 +18,8 @@ pub enum ConnectError {
     Config(String),
     #[error("endpoint setup failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    AutoConfig(#[from] AutoConfigError),
 }
 
 /// Token-handshake outcomes, derived from the server's connection-close code.
@@ -61,4 +63,38 @@ pub enum SendError {
         attempts: u32,
         last: Box<ConnectError>,
     },
+}
+
+/// `connect_auto` could not establish a session. `fallback_endpoint` / `fallback_error`
+/// are set when a configured fallback failed too.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct AutoConfigError {
+    pub reason: FallbackReason,
+    pub fallback_endpoint: Option<String>,
+    pub fallback_error: Option<Box<ConnectError>>,
+}
+
+impl fmt::Display for AutoConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "autoconfiguration failed: {}", self.reason)?;
+        match (&self.fallback_endpoint, &self.fallback_error) {
+            (Some(endpoint), Some(error)) => {
+                write!(f, "; fallback endpoint {endpoint} also failed: {error}")
+            }
+            _ => write!(
+                f,
+                "; no fallback_endpoint configured — set AutoConfig::fallback_endpoint \
+                 or connect manually with SolanaGunQuicClient::connect"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AutoConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.fallback_error
+            .as_deref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
+    }
 }

@@ -39,6 +39,27 @@ export COUNT=4                       # optional, default 1
 cargo run --release --example send
 ```
 
+## Endpoint autoconfiguration
+
+Optional: use `connect_auto` instead of `connect` to let the client pick the endpoint.
+
+- Fetches the endpoint list from the discovery API over HTTPS (default `https://www.allnodes.com/api/v1/solana-gun/discovery`).
+- Probes every endpoint over QUIC and connects to the one with the lowest latency.
+- Keeps that endpoint for the whole session (no runtime failover).
+
+```rust
+let mut auto = AutoConfig::default();
+auto.discovery_url = "https://my-proxy.example/discovery".into(); // optional override
+auto.fallback_endpoint = Some("fra1.solanagun.com:7000".into()); // optional static fallback
+
+let client = SolanaGunQuicClient::connect_auto("my-token", ClientConfig::default(), auto).await?;
+println!("{:?}", client.endpoint_source()); // Discovered { .. } or Fallback { reason, .. }
+```
+
+The static fallback is used when discovery fails, returns no usable endpoints, every probe fails, or the selected endpoint cannot connect. No fallback is bundled: without one, these cases return `ConnectError::AutoConfig` with the reason. The endpoint source and fallback reason are also logged via `tracing`.
+
+A runnable smoke test lives in `examples/send_auto.rs` (`TOKEN` required; `DISCOVERY_URL`, `FALLBACK_HOST` optional).
+
 ## Full transfer example
 
 `examples/transfer.rs` is a self-contained end-to-end demo: it loads your Solana keypair, fetches a recent blockhash, builds a v0 `VersionedTransaction` with two `SystemProgram::Transfer` instructions (recipient + tip), serializes it with `wincode` (byte-identical to bincode for legacy/v0, and the only codec that encodes v1), and submits it over the QUIC ingress. The Solana Gun production tip addresses are pre-filled; pick one via `TIP_INDEX`.
@@ -75,7 +96,7 @@ This is fire-and-forget: the example prints the locally-computed signature and e
 
 Errors split into three enums:
 
-- **`ConnectError`** — dial/handshake/TLS/config failures.
+- **`ConnectError`** — dial/handshake/TLS/config failures; `AutoConfig` when autoconfiguration fails.
 - **`HandshakeError`** — token outcome (`Unauthorized`, `Revoked`, `TooManyConnections`, `BadRequest`, `Timeout`, …).
 - **`SendError`** — per-transaction failures, including reconnection results (`Reconnect`, `ReconnectExhausted`).
 
@@ -108,7 +129,7 @@ Maximum token length is 200 ASCII-graphic bytes (`MAX_TOKEN_BYTES`).
 
 ## MSRV
 
-Edition 2024 (Rust 1.85+).
+Edition 2024 (Rust 1.88+).
 
 ## License
 

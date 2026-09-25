@@ -2,26 +2,39 @@ use {crate::error::ConnectError, std::sync::Arc};
 
 pub(crate) const ALPN: &[u8] = b"solana-gun-ingress/1";
 
-/// TLS 1.3 WebPKI client config; `root_store` override or system roots.
+/// TLS 1.3 WebPKI client config for QUIC; `root_store` override or system roots.
 pub(crate) fn rustls_client_config(
     root_store: Option<&Arc<rustls::RootCertStore>>,
 ) -> Result<Arc<rustls::ClientConfig>, ConnectError> {
+    let mut cfg = base_client_config(root_store)?;
+    cfg.alpn_protocols = vec![ALPN.to_vec()];
+    Ok(Arc::new(cfg))
+}
+
+/// Same trust and provider as QUIC, without the ingress ALPN, for HTTPS discovery.
+pub(crate) fn https_client_config(
+    root_store: Option<&Arc<rustls::RootCertStore>>,
+) -> Result<rustls::ClientConfig, ConnectError> {
+    base_client_config(root_store)
+}
+
+fn base_client_config(
+    root_store: Option<&Arc<rustls::RootCertStore>>,
+) -> Result<rustls::ClientConfig, ConnectError> {
     let roots = match root_store {
         Some(roots) => Arc::clone(roots),
         None => Arc::new(system_roots()?),
     };
-    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+    Ok(rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_protocol_versions(&[&rustls::version::TLS13])
     .expect("ring provider supports TLS 1.3")
     .with_root_certificates(roots)
-    .with_no_client_auth();
-    cfg.alpn_protocols = vec![ALPN.to_vec()];
-    Ok(Arc::new(cfg))
+    .with_no_client_auth())
 }
 
-fn system_roots() -> Result<rustls::RootCertStore, ConnectError> {
+pub(crate) fn system_roots() -> Result<rustls::RootCertStore, ConnectError> {
     let loaded = rustls_native_certs::load_native_certs();
     let mut store = rustls::RootCertStore::empty();
     store.add_parsable_certificates(loaded.certs);

@@ -1,6 +1,6 @@
 [package]
 name = "solana-gun-quic-client"
-version = "1.0.0"
+version = "1.2.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -12,10 +12,15 @@ rustls-native-certs = "0.8.4"
 tokio = { version = "1.48.0", features = ["net", "time", "rt", "sync"] }
 thiserror = "2.0.17"
 zeroize = "1.8"
+reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls-native-roots"] }
+serde = { version = "1.0.215", features = ["derive"] }
+serde_json = "1.0.116"
+tracing = "0.1.40"
 
 [dev-dependencies]
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
 rcgen = "0.13"
+tokio-rustls = { version = "0.26", default-features = false }
 anyhow = "1.0.100"
 wincode = "0.5"
 solana-client = "=4.1.2" # umbrella; provides nonblocking::rpc_client::RpcClient

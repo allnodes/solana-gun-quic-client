@@ -1,5 +1,6 @@
 use {
     crate::{
+        autoconfig::EndpointSource,
         config::{ClientConfig, ReconnectPolicy},
         error::{ConnectError, HandshakeError, SendError},
         tls,
@@ -38,6 +39,7 @@ struct Inner {
     send_timeout: Duration,
     connection: RwLock<Arc<Connection>>,
     reconnect_lock: Mutex<()>,
+    source: EndpointSource,
 }
 
 #[derive(Clone)]
@@ -52,6 +54,17 @@ impl SolanaGunQuicClient {
         server_name: &str,
         token: &str,
         config: ClientConfig,
+    ) -> Result<Self, ConnectError> {
+        Self::connect_addr_with_source(addr, server_name, token, config, EndpointSource::Manual)
+            .await
+    }
+
+    pub(crate) async fn connect_addr_with_source(
+        addr: SocketAddr,
+        server_name: &str,
+        token: &str,
+        config: ClientConfig,
+        source: EndpointSource,
     ) -> Result<Self, ConnectError> {
         config.validate()?;
         validate_token(token)?;
@@ -72,6 +85,7 @@ impl SolanaGunQuicClient {
                 send_timeout: config.send_timeout,
                 connection: RwLock::new(Arc::new(connection)),
                 reconnect_lock: Mutex::new(()),
+                source,
             }),
         })
     }
@@ -83,6 +97,15 @@ impl SolanaGunQuicClient {
         addr: &str,
         token: &str,
         config: ClientConfig,
+    ) -> Result<Self, ConnectError> {
+        Self::connect_with_source(addr, token, config, EndpointSource::Manual).await
+    }
+
+    pub(crate) async fn connect_with_source(
+        addr: &str,
+        token: &str,
+        config: ClientConfig,
+        source: EndpointSource,
     ) -> Result<Self, ConnectError> {
         config.validate()?;
         validate_token(token)?;
@@ -110,12 +133,37 @@ impl SolanaGunQuicClient {
         }
         let mut last_err = None;
         for sockaddr in addrs {
-            match Self::connect_addr(sockaddr, &host, token, config.clone()).await {
+            match Self::connect_addr_with_source(
+                sockaddr,
+                &host,
+                token,
+                config.clone(),
+                source.clone(),
+            )
+            .await
+            {
                 Ok(client) => return Ok(client),
                 Err(e) => last_err = Some(e),
             }
         }
         Err(last_err.unwrap_or_else(|| ConnectError::Resolve(format!("no addresses for {addr}"))))
+    }
+
+    /// Opt-in autoconfiguration: query `auto.discovery_url`, probe every returned
+    /// endpoint over QUIC, and connect through the lowest-latency reachable one. If that
+    /// fails, connect to `auto.fallback_endpoint`, or return [`ConnectError::AutoConfig`]
+    /// when none is set. The chosen endpoint is kept for the client's lifetime.
+    pub async fn connect_auto(
+        token: &str,
+        config: ClientConfig,
+        auto: crate::autoconfig::AutoConfig,
+    ) -> Result<Self, ConnectError> {
+        crate::autoconfig::connect_auto(token, config, auto).await
+    }
+
+    /// How the active endpoint was chosen; fixed for the client's lifetime.
+    pub fn endpoint_source(&self) -> &EndpointSource {
+        &self.inner.source
     }
 
     /// Fire-and-forget with transparent reconnect. Returns Ok once the bytes are written
@@ -194,7 +242,10 @@ impl SolanaGunQuicClient {
     }
 }
 
-fn build_endpoint(addr: SocketAddr, config: &ClientConfig) -> Result<Endpoint, ConnectError> {
+pub(crate) fn build_endpoint(
+    addr: SocketAddr,
+    config: &ClientConfig,
+) -> Result<Endpoint, ConnectError> {
     let rustls_cfg = tls::rustls_client_config(config.root_store.as_ref())?;
     let quic_crypto = QuicClientConfig::try_from((*rustls_cfg).clone())
         .map_err(|e| ConnectError::Tls(e.to_string()))?;
@@ -234,9 +285,32 @@ fn handshake_reply_ok(buf: &[u8]) -> bool {
     buf == b"OK\n"
 }
 
+/// Split `host:port` or `[v6-literal]:port`; the port must be a non-zero u16.
+pub(crate) fn split_host_port(addr: &str) -> Result<(&str, &str), String> {
+    let (host, port) = if let Some(rest) = addr.strip_prefix('[') {
+        let (host, after) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("unterminated IPv6 literal in {addr}"))?;
+        let port = after
+            .strip_prefix(':')
+            .ok_or_else(|| format!("missing port in {addr}"))?;
+        (host, port)
+    } else {
+        addr.rsplit_once(':')
+            .ok_or_else(|| format!("missing port in {addr}"))?
+    };
+    if host.is_empty() {
+        return Err(format!("missing host in {addr}"));
+    }
+    match port.parse::<u16>() {
+        Ok(p) if p != 0 => Ok((host, port)),
+        _ => Err(format!("invalid port in {addr}")),
+    }
+}
+
 /// Reject tokens the server's line-based handshake parser would refuse, so a bad token
 /// fails locally with a clear error instead of an opaque server BadRequest.
-fn validate_token(token: &str) -> Result<(), ConnectError> {
+pub(crate) fn validate_token(token: &str) -> Result<(), ConnectError> {
     if token.is_empty() {
         return Err(ConnectError::Config("token is empty".into()));
     }
@@ -374,22 +448,24 @@ const fn code_to_err(code: u64) -> HandshakeError {
 }
 
 #[cfg(test)]
-mod terminal_tests {
+pub(crate) mod test_support {
     use {
         super::*,
         std::net::{Ipv4Addr, SocketAddr},
     };
 
-    /// Stand up an in-process quinn server with a fresh self-signed cert (ALPN matched to
-    /// the client's), accept-and-ignore connections, and return its bound address. The
-    /// client will fail at certificate verification before the handshake completes.
-    async fn spawn_untrusted_server() -> SocketAddr {
+    /// In-process QUIC server with a fresh self-signed cert for `127.0.0.1` that
+    /// completes the QUIC handshake and then idles. Returns its address and a root
+    /// store trusting it; with system roots the server is untrusted.
+    pub(crate) async fn spawn_stub_server() -> (SocketAddr, Arc<rustls::RootCertStore>) {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
         let key_der = rustls::pki_types::PrivateKeyDer::from(
             rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
         );
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der.clone()).unwrap();
 
         let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
@@ -410,20 +486,27 @@ mod terminal_tests {
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 tokio::spawn(async move {
-                    let _ = incoming.await;
+                    if let Ok(conn) = incoming.await {
+                        conn.closed().await;
+                    }
                 });
             }
         });
-        addr
+        (addr, Arc::new(roots))
     }
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
 
     #[tokio::test]
     async fn untrusted_cert_is_terminal() {
-        let addr = spawn_untrusted_server().await;
+        let (addr, _roots) = test_support::spawn_stub_server().await;
         let config = ClientConfig::default();
         let endpoint = build_endpoint(addr, &config).unwrap();
 
-        let err = dial_and_handshake(&endpoint, addr, "localhost", "tok")
+        let err = dial_and_handshake(&endpoint, addr, "127.0.0.1", "tok")
             .await
             .expect_err("handshake must fail on an untrusted certificate");
         assert!(
