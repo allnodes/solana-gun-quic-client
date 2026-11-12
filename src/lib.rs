@@ -4,10 +4,11 @@ mod autoconfig;
 mod client;
 mod config;
 mod error;
+pub mod plaintext;
 mod tls;
 
 pub use autoconfig::{AutoConfig, DEFAULT_DISCOVERY_URL, EndpointSource, FallbackReason};
 pub use client::SolanaGunQuicClient;
-pub use config::{ClientConfig, ReconnectPolicy};
+pub use config::{ClientConfig, ReconnectPolicy, Security};
 pub use error::{AutoConfigError, ConnectError, HandshakeError, SendError};
 pub use rustls::RootCertStore;

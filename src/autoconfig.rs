@@ -4,7 +4,7 @@
 use {
     crate::{
         client::{self, SolanaGunQuicClient},
-        config::ClientConfig,
+        config::{ClientConfig, Security},
         error::{AutoConfigError, ConnectError},
         tls,
     },
@@ -184,13 +184,13 @@ pub(crate) fn select_best(results: &[(usize, ProbeOk)]) -> Option<usize> {
 const MAX_CONCURRENT_PROBES: usize = 16;
 
 pub(crate) async fn connect_auto(
-    token: &str,
+    token: Option<&str>,
     config: ClientConfig,
     auto: AutoConfig,
 ) -> Result<SolanaGunQuicClient, ConnectError> {
-    config.validate()?;
-    client::validate_token(token)?;
+    client::validate_credentials(token, &config)?;
     auto.validate()?;
+    // System roots serve HTTPS discovery, which stays verified under SkipVerification.
     let config = with_resolved_roots(config).await?;
 
     let reason = match try_discovered(token, &config, &auto).await {
@@ -242,7 +242,7 @@ async fn with_resolved_roots(mut config: ClientConfig) -> Result<ClientConfig, C
 }
 
 async fn try_discovered(
-    token: &str,
+    token: Option<&str>,
     config: &ClientConfig,
     auto: &AutoConfig,
 ) -> Result<SolanaGunQuicClient, FallbackReason> {
@@ -490,7 +490,8 @@ pub(crate) async fn probe_addrs(
     })
 }
 
-/// Times a TLS-verified QUIC handshake. No token is sent, so probes never use a
+/// Times a QUIC handshake in the configured security mode; in unencrypted mode that is
+/// the control exchange (one round trip). No token is sent, so probes never use a
 /// per-token connection slot.
 async fn probe_addr(
     addr: SocketAddr,
@@ -503,10 +504,26 @@ async fn probe_addr(
         .connect(addr, server_name)
         .map_err(|e| e.to_string())?
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| probe_error(&e, config.security))?;
     let latency = started.elapsed();
     connection.close(quinn::VarInt::from_u32(0), b"probe");
     Ok(latency)
+}
+
+/// A version mismatch means the discovery list holds ports of the other mode.
+fn probe_error(e: &quinn::ConnectionError, security: Security) -> String {
+    match e {
+        quinn::ConnectionError::VersionMismatch if security == Security::Unencrypted => {
+            "version mismatch: not an unencrypted QUIC port (Security::Unencrypted needs a \
+             discovery URL that lists unencrypted ports)"
+                .into()
+        }
+        quinn::ConnectionError::VersionMismatch => format!(
+            "version mismatch: not a TLS QUIC port (Security::{security:?} needs a discovery \
+             URL that lists TLS ports)"
+        ),
+        other => other.to_string(),
+    }
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 # solana-gun-quic-client
 
-Rust client for the Solana Gun QUIC transaction-submission ingress. Token-authenticated, standard TLS (WebPKI), fire-and-forget.
+Rust client for the Solana Gun QUIC transaction-submission ingress. Token-authenticated or tokenless; WebPKI-verified TLS by default, with an opt-in unencrypted mode; fire-and-forget or confirmed sends.
 
 ## What it does
 
@@ -39,12 +39,44 @@ export COUNT=4                       # optional, default 1
 cargo run --release --example send
 ```
 
+## Security modes
+
+`ClientConfig.security` selects the QUIC mode. It is never changed automatically.
+
+| `Security` | Transport | Server identity | Token |
+|---|---|---|---|
+| `VerifiedTls` (default) | TLS 1.3 | verified (WebPKI chain + hostname) | allowed |
+| `SkipVerification` | TLS 1.3 | **not verified** | allowed; logs a warning |
+| `Unencrypted` | no TLS, private QUIC version | none | **refused** with `ConnectError::Config` before any I/O |
+
+`Unencrypted` connects to the Gun's separate unencrypted port. There is no handshake round trip: the first transaction goes out in the client's first packets. Use it only where these risks are acceptable:
+
+- Anyone on the path can read, alter or drop transactions, or pose as the Gun.
+- The source address is not verified, so a third party can use up your address's tokenless quota.
+
+Before the server's first reply the client can open 4 uni and 4 bidi streams, 4096 bytes each, 32 KiB in total (constants in `plaintext`).
+
+A mode that does not match the port fails with `VersionMismatch` (a TLS client on the unencrypted port, or the reverse) and is not retried.
+
+## Tokenless submission
+
+`connect_anonymous`, `connect_addr_anonymous` and `connect_auto_anonymous` connect without a token. Over TLS they return without waiting for the server's reply. If the Gun has tokenless off (`Unauthorized`) or does not support it (`TokenlessUnsupported`), the next send fails with `SendError::Reconnect(..)`.
+
+## Send completion
+
+| Method | `Ok` means | Rate limit |
+|---|---|---|
+| `send_transaction_bytes` | the transport delivered the stream, not that the Gun admitted it | not reported |
+| `send_transaction_bytes_confirmed` | the Gun accepted the transaction | `SendError::RateLimited { retry_after }` |
+
+A confirmed send waits for the Gun's verdict up to `send_timeout`; a refused transaction is `SendError::Rejected`. It is never resubmitted after a verdict or a timeout. Against a Gun without verdict support it ends in `SendError::Timeout`.
+
 ## Endpoint autoconfiguration
 
-Optional: use `connect_auto` instead of `connect` to let the client pick the endpoint.
+Optional: use `connect_auto` (or `connect_auto_anonymous`) instead of `connect` to let the client pick the endpoint.
 
-- Fetches the endpoint list from the discovery API over HTTPS (default `https://www.allnodes.com/api/v1/solana-gun/discovery`).
-- Probes every endpoint over QUIC and connects to the one with the lowest latency.
+- Fetches the endpoint list from the discovery API over HTTPS (default `https://www.allnodes.com/api/v1/solana-gun/discovery`). Discovery is always verified HTTPS, whatever the QUIC mode.
+- Probes every endpoint over QUIC in the configured security mode and connects to the one with the lowest latency.
 - Keeps that endpoint for the whole session (no runtime failover).
 
 ```rust
@@ -55,6 +87,8 @@ auto.fallback_endpoint = Some("fra1.solanagun.com:7000".into()); // optional sta
 let client = SolanaGunQuicClient::connect_auto("my-token", ClientConfig::default(), auto).await?;
 println!("{:?}", client.endpoint_source()); // Discovered { .. } or Fallback { reason, .. }
 ```
+
+The discovery URL and `fallback_endpoint` must give endpoints of the selected mode (for `Unencrypted`, the Gun's unencrypted ports). The client never switches mode or guesses a port.
 
 The static fallback is used when discovery fails, returns no usable endpoints, every probe fails, or the selected endpoint cannot connect. No fallback is bundled: without one, these cases return `ConnectError::AutoConfig` with the reason. The endpoint source and fallback reason are also logged via `tracing`.
 
@@ -80,6 +114,7 @@ This is fire-and-forget: the example prints the locally-computed signature and e
 
 | Field | Default | Notes |
 |---|---|---|
+| `security` | `VerifiedTls` | See [Security modes](#security-modes). |
 | `root_store` | `None` (system roots) | Override trust roots for tests; chain + hostname validation always runs. |
 | `idle_timeout` | 30 s | Connection idle deadline (QUIC transport setting). |
 | `keep_alive_interval` | 10 s | Must be `< idle_timeout`. |
@@ -108,6 +143,8 @@ The reconnect loop distinguishes **terminal** from **transient**:
 | `HandshakeError::Revoked` | Terminal — the server removed your token. |
 | `HandshakeError::BadRequest` | Terminal — client/protocol mismatch. |
 | `ConnectError::Tls(_)` or TLS handshake alert (e.g. untrusted server certificate) | Terminal. |
+| `ConnectError::Connection(VersionMismatch)` (wrong kind of port for the mode) | Terminal. |
+| `HandshakeError::TokenlessUnsupported` (tokenless client, old server) | Terminal. |
 | `HandshakeError::TooManyConnections` | Transient — retried with backoff. |
 | Network reset / timeout / refused / DNS hiccup | Transient — retried with backoff. |
 
@@ -119,9 +156,10 @@ A **stream-level** reset by the server (close code `0x10`, used for per-tx backp
 |---|---|
 | ALPN | `solana-gun-ingress/1` |
 | TLS | 1.3 only, server cert validated against system roots + hostname (WebPKI) |
-| Handshake | bidi stream: client sends `SOLANA-GUN-QUIC/1 <token>\n`, server replies `OK\n` then closes |
+| Handshake | bidi stream: client sends `SOLANA-GUN-QUIC/1 <token>\n`, server replies `OK\n` then closes; tokenless: `SOLANA-GUN-QUIC/1-ANON\n`, not awaited |
+| Unencrypted mode | QUIC version `0x53470001`, no TLS, no ALPN, no hello stream; first stream in 0-RTT |
 | Submission | one uni-stream per transaction, ≤ 4096 bytes (v1 transaction limit) |
-| Server response | none (fire-and-forget) |
+| Server response | none on uni-streams; confirmed sends: bidi stream, verdict `0x00` accepted · `0x01` + u32 LE ms rate limited · `0x02` rejected |
 | Close codes | `0x01` unauthorized · `0x02` bad request · `0x03` too many connections · `0x04` revoked |
 | Stream reset code | `0x10` (backpressure / oversized / decode failure) |
 

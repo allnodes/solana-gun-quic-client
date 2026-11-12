@@ -34,6 +34,8 @@ pub enum HandshakeError {
     BadRequest,
     #[error("revoked")]
     Revoked,
+    #[error("server does not support tokenless submission")]
+    TokenlessUnsupported,
     #[error("handshake i/o error: {0}")]
     Io(#[from] std::io::Error),
     #[error("handshake timed out")]
@@ -56,6 +58,10 @@ pub enum SendError {
     StreamWrite(#[from] quinn::WriteError),
     #[error("stream closed before finish: {0}")]
     StreamClosed(#[from] quinn::ClosedStream),
+    #[error("rate limited by the server; retry after {retry_after:?}")]
+    RateLimited { retry_after: std::time::Duration },
+    #[error("transaction rejected by the server")]
+    Rejected,
     #[error("reconnect failed: {0}")]
     Reconnect(#[from] ConnectError),
     #[error("reconnect gave up after {attempts} attempts; last error: {last}")]

@@ -1,16 +1,16 @@
 use {
     crate::{
         autoconfig::EndpointSource,
-        config::{ClientConfig, ReconnectPolicy},
+        config::{ClientConfig, ReconnectPolicy, Security},
         error::{ConnectError, HandshakeError, SendError},
-        tls,
+        plaintext, tls,
     },
     quinn::{
-        ClientConfig as QuinnClientConfig, Connection, Endpoint, VarInt,
-        crypto::rustls::QuicClientConfig,
+        ClientConfig as QuinnClientConfig, Connection, ConnectionError, Endpoint, RecvStream,
+        SendStream, VarInt, crypto::rustls::QuicClientConfig,
     },
-    std::{net::SocketAddr, sync::Arc, time::Duration},
-    tokio::sync::{Mutex, RwLock},
+    std::{net::SocketAddr, ops::Deref, pin::pin, sync::Arc, time::Duration},
+    tokio::sync::{Mutex, RwLock, watch},
     zeroize::Zeroizing,
 };
 
@@ -22,6 +22,8 @@ pub(crate) const MAX_TX_BYTES: usize = 4096;
 const MAX_TOKEN_BYTES: usize = 200;
 /// Handshake line prefix (note the trailing space).
 const HANDSHAKE_PREFIX: &str = "SOLANA-GUN-QUIC/1 ";
+/// Tokenless hello line (no trailing-space prefix, so it cannot collide with a token).
+const ANON_HELLO: &[u8] = b"SOLANA-GUN-QUIC/1-ANON\n";
 
 /// Connection-close application codes used by the server.
 const CLOSE_UNAUTHORIZED: u64 = 0x01;
@@ -34,12 +36,73 @@ struct Inner {
     endpoint: Endpoint,
     addr: SocketAddr,
     server_name: String,
-    token: Zeroizing<String>,
+    token: Option<Zeroizing<String>>,
+    security: Security,
+    /// Tokenless: the handshake stream's receive half, kept open for the connection's
+    /// lifetime and never read; replaced on reconnect.
+    anon_recv: std::sync::Mutex<Option<RecvStream>>,
     reconnect: ReconnectPolicy,
     send_timeout: Duration,
-    connection: RwLock<Arc<Connection>>,
+    connection: RwLock<Arc<Conn>>,
     reconnect_lock: Mutex<()>,
     source: EndpointSource,
+}
+
+/// A connection plus, in unencrypted mode, its establishment signal.
+#[derive(Debug)]
+struct Conn {
+    conn: Connection,
+    /// Unencrypted only: becomes `true` once the connection is established or failed.
+    /// quinn raises the stream limits from the compiled-in early values to the
+    /// server's real ones without waking an open already waiting at the early limit,
+    /// so such an open is retried afresh at that point.
+    settled: Option<watch::Receiver<bool>>,
+}
+
+impl Deref for Conn {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl Conn {
+    const fn established(conn: Connection) -> Self {
+        Self {
+            conn,
+            settled: None,
+        }
+    }
+
+    async fn wait_settled(&self) {
+        if let Some(rx) = &self.settled {
+            let _ = rx.clone().wait_for(|settled| *settled).await;
+        }
+    }
+
+    async fn open_uni(&self) -> Result<SendStream, ConnectionError> {
+        if self.settled.is_none() {
+            return self.conn.open_uni().await;
+        }
+        let mut open = pin!(self.conn.open_uni());
+        tokio::select! {
+            biased;
+            r = &mut open => r,
+            () = self.wait_settled() => self.conn.open_uni().await,
+        }
+    }
+
+    async fn open_bi(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
+        if self.settled.is_none() {
+            return self.conn.open_bi().await;
+        }
+        let mut open = pin!(self.conn.open_bi());
+        tokio::select! {
+            biased;
+            r = &mut open => r,
+            () = self.wait_settled() => self.conn.open_bi().await,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -55,23 +118,47 @@ impl SolanaGunQuicClient {
         token: &str,
         config: ClientConfig,
     ) -> Result<Self, ConnectError> {
-        Self::connect_addr_with_source(addr, server_name, token, config, EndpointSource::Manual)
+        Self::connect_addr_with_source(
+            addr,
+            server_name,
+            Some(token),
+            config,
+            EndpointSource::Manual,
+        )
+        .await
+    }
+
+    /// Tokenless twin of [`Self::connect_addr`]. Returns without waiting for the
+    /// server's reply; a refusal surfaces on a later send (which may itself have
+    /// returned `Ok` if it raced the close) as `SendError::Reconnect` with
+    /// `TokenlessUnsupported` (old server) or `Unauthorized` (tokenless disabled).
+    pub async fn connect_addr_anonymous(
+        addr: SocketAddr,
+        server_name: &str,
+        config: ClientConfig,
+    ) -> Result<Self, ConnectError> {
+        Self::connect_addr_with_source(addr, server_name, None, config, EndpointSource::Manual)
             .await
     }
 
     pub(crate) async fn connect_addr_with_source(
         addr: SocketAddr,
         server_name: &str,
-        token: &str,
+        token: Option<&str>,
         config: ClientConfig,
         source: EndpointSource,
     ) -> Result<Self, ConnectError> {
-        config.validate()?;
-        validate_token(token)?;
+        validate_credentials(token, &config)?;
         let endpoint = build_endpoint(addr, &config)?;
-        let connection = tokio::time::timeout(
+        // Before dialing: a failed attempt has sent the token too.
+        if token.is_some() && config.security == Security::SkipVerification {
+            tracing::warn!(
+                "server identity is not verified; the token is sent to an unauthenticated server"
+            );
+        }
+        let (connection, anon_recv) = tokio::time::timeout(
             config.reconnect.connect_timeout,
-            dial_and_handshake(&endpoint, addr, server_name, token),
+            dial_and_handshake(&endpoint, addr, server_name, token, config.security),
         )
         .await
         .map_err(|_| ConnectError::Handshake(HandshakeError::Timeout))??;
@@ -80,7 +167,9 @@ impl SolanaGunQuicClient {
                 endpoint,
                 addr,
                 server_name: server_name.to_owned(),
-                token: Zeroizing::new(token.to_owned()),
+                token: token.map(|t| Zeroizing::new(t.to_owned())),
+                security: config.security,
+                anon_recv: std::sync::Mutex::new(anon_recv),
                 reconnect: config.reconnect,
                 send_timeout: config.send_timeout,
                 connection: RwLock::new(Arc::new(connection)),
@@ -98,17 +187,21 @@ impl SolanaGunQuicClient {
         token: &str,
         config: ClientConfig,
     ) -> Result<Self, ConnectError> {
-        Self::connect_with_source(addr, token, config, EndpointSource::Manual).await
+        Self::connect_with_source(addr, Some(token), config, EndpointSource::Manual).await
+    }
+
+    /// Tokenless twin of [`Self::connect`]; see [`Self::connect_addr_anonymous`].
+    pub async fn connect_anonymous(addr: &str, config: ClientConfig) -> Result<Self, ConnectError> {
+        Self::connect_with_source(addr, None, config, EndpointSource::Manual).await
     }
 
     pub(crate) async fn connect_with_source(
         addr: &str,
-        token: &str,
+        token: Option<&str>,
         config: ClientConfig,
         source: EndpointSource,
     ) -> Result<Self, ConnectError> {
-        config.validate()?;
-        validate_token(token)?;
+        validate_credentials(token, &config)?;
         let host = if let Some(rest) = addr.strip_prefix('[') {
             rest.split_once(']')
                 .map(|(h, _)| h.to_owned())
@@ -158,7 +251,15 @@ impl SolanaGunQuicClient {
         config: ClientConfig,
         auto: crate::autoconfig::AutoConfig,
     ) -> Result<Self, ConnectError> {
-        crate::autoconfig::connect_auto(token, config, auto).await
+        crate::autoconfig::connect_auto(Some(token), config, auto).await
+    }
+
+    /// Tokenless twin of [`Self::connect_auto`].
+    pub async fn connect_auto_anonymous(
+        config: ClientConfig,
+        auto: crate::autoconfig::AutoConfig,
+    ) -> Result<Self, ConnectError> {
+        crate::autoconfig::connect_auto(None, config, auto).await
     }
 
     /// How the active endpoint was chosen; fixed for the client's lifetime.
@@ -166,8 +267,9 @@ impl SolanaGunQuicClient {
         &self.inner.source
     }
 
-    /// Fire-and-forget with transparent reconnect. Returns Ok once the bytes are written
-    /// and the uni-stream finished — i.e. queued in the local QUIC send buffer.
+    /// Fire-and-forget with transparent reconnect. Returns Ok once the server's QUIC
+    /// transport has acknowledged the whole stream (or stopped it). That is not an
+    /// admission: rate limits and rejections are not reported here.
     pub async fn send_transaction_bytes(&self, tx_bytes: &[u8]) -> Result<(), SendError> {
         if tx_bytes.len() > MAX_TX_BYTES {
             return Err(SendError::TooLarge(tx_bytes.len()));
@@ -187,13 +289,57 @@ impl SolanaGunQuicClient {
         }
     }
 
+    /// Sends on a bidirectional verdict stream and waits for the server's answer:
+    /// `Ok` accepted, `RateLimited` or `Rejected` otherwise. A server without verdict
+    /// support never answers, so this ends in `Timeout`. Only a send that never reached
+    /// the server (connection already lost, or early data discarded) triggers a
+    /// reconnect and retry; a verdict or a timeout never resubmits.
+    pub async fn send_transaction_bytes_confirmed(&self, tx_bytes: &[u8]) -> Result<(), SendError> {
+        if tx_bytes.len() > MAX_TX_BYTES {
+            return Err(SendError::TooLarge(tx_bytes.len()));
+        }
+        let timeout = self.inner.send_timeout;
+        let conn = self.inner.connection.read().await.clone();
+        match confirm_on_timed(&conn, tx_bytes, timeout).await {
+            Err(Confirm::NotSent(_)) if self.inner.reconnect.enabled => {
+                let fresh = self.reconnect(&conn).await?;
+                confirm_on_timed(&fresh, tx_bytes, timeout)
+                    .await
+                    .map_err(Confirm::into_error)
+            }
+            other => other.map_err(Confirm::into_error),
+        }
+    }
+
     /// Re-establish the connection if `stale` is still the current one.
-    async fn reconnect(&self, stale: &Arc<Connection>) -> Result<Arc<Connection>, SendError> {
+    async fn reconnect(&self, stale: &Arc<Conn>) -> Result<Arc<Conn>, SendError> {
         let _guard = self.inner.reconnect_lock.lock().await;
         {
             let cur = self.inner.connection.read().await.clone();
             if !Arc::ptr_eq(&cur, stale) {
                 return Ok(cur);
+            }
+        }
+        if let Some(ConnectionError::VersionMismatch) = stale.close_reason() {
+            return Err(SendError::Reconnect(
+                ConnectionError::VersionMismatch.into(),
+            ));
+        }
+        if self.inner.token.is_none()
+            && let Some(ConnectionError::ApplicationClosed(ac)) = stale.close_reason()
+        {
+            match ac.error_code.into_inner() {
+                // Unencrypted has no hello: 0x02 there is the control-exchange
+                // deadline (e.g. a lossy link), so it is transient.
+                CLOSE_BAD_REQUEST if self.inner.security != Security::Unencrypted => {
+                    return Err(SendError::Reconnect(
+                        HandshakeError::TokenlessUnsupported.into(),
+                    ));
+                }
+                CLOSE_UNAUTHORIZED => {
+                    return Err(SendError::Reconnect(HandshakeError::Unauthorized.into()));
+                }
+                _ => {}
             }
         }
         let policy = &self.inner.reconnect;
@@ -206,12 +352,14 @@ impl SolanaGunQuicClient {
                     &self.inner.endpoint,
                     self.inner.addr,
                     &self.inner.server_name,
-                    &self.inner.token,
+                    self.inner.token.as_deref().map(String::as_str),
+                    self.inner.security,
                 ),
             )
             .await;
             let last = match attempt {
-                Ok(Ok(conn)) => {
+                Ok(Ok((conn, anon_recv))) => {
+                    *self.inner.anon_recv.lock().unwrap() = anon_recv;
                     let arc = Arc::new(conn);
                     *self.inner.connection.write().await = Arc::clone(&arc);
                     return Ok(arc);
@@ -246,10 +394,14 @@ pub(crate) fn build_endpoint(
     addr: SocketAddr,
     config: &ClientConfig,
 ) -> Result<Endpoint, ConnectError> {
-    let rustls_cfg = tls::rustls_client_config(config.root_store.as_ref())?;
-    let quic_crypto = QuicClientConfig::try_from((*rustls_cfg).clone())
-        .map_err(|e| ConnectError::Tls(e.to_string()))?;
-    let mut quinn_cfg = QuinnClientConfig::new(Arc::new(quic_crypto));
+    let mut quinn_cfg = if config.security == Security::Unencrypted {
+        plaintext::client_config()
+    } else {
+        let rustls_cfg = tls::rustls_client_config(config.security, config.root_store.as_ref())?;
+        let quic_crypto = QuicClientConfig::try_from((*rustls_cfg).clone())
+            .map_err(|e| ConnectError::Tls(e.to_string()))?;
+        QuinnClientConfig::new(Arc::new(quic_crypto))
+    };
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(
         config
@@ -264,7 +416,17 @@ pub(crate) fn build_endpoint(
     } else {
         "[::]:0".parse().unwrap()
     };
-    let mut endpoint = Endpoint::client(bind)?;
+    let mut endpoint = if config.security == Security::Unencrypted {
+        // Lists only the private version; never offered to a TLS port.
+        Endpoint::new(
+            plaintext::endpoint_config(),
+            None,
+            std::net::UdpSocket::bind(bind)?,
+            Arc::new(quinn::TokioRuntime),
+        )?
+    } else {
+        Endpoint::client(bind)?
+    };
     endpoint.set_default_client_config(quinn_cfg);
     Ok(endpoint)
 }
@@ -273,11 +435,67 @@ async fn dial_and_handshake(
     endpoint: &Endpoint,
     addr: SocketAddr,
     server_name: &str,
-    token: &str,
-) -> Result<Connection, ConnectError> {
-    let connection = endpoint.connect(addr, server_name)?.await?;
-    handshake(&connection, token).await?;
-    Ok(connection)
+    token: Option<&str>,
+    security: Security,
+) -> Result<(Conn, Option<RecvStream>), ConnectError> {
+    let connecting = endpoint.connect(addr, server_name)?;
+    if security == Security::Unencrypted {
+        // Returns at once; the first stream goes out in the first flight. No hello stream.
+        return Ok((dial_unencrypted(connecting).await?, None));
+    }
+    let connection = connecting.await?;
+    match token {
+        Some(token) => {
+            handshake(&connection, token).await?;
+            Ok((Conn::established(connection), None))
+        }
+        None => {
+            let recv = anonymous_hello(&connection).await?;
+            Ok((Conn::established(connection), Some(recv)))
+        }
+    }
+}
+
+async fn dial_unencrypted(connecting: quinn::Connecting) -> Result<Conn, ConnectionError> {
+    match connecting.into_0rtt() {
+        Ok((conn, accepted)) => {
+            let (tx, rx) = watch::channel(false);
+            tokio::spawn(async move {
+                let _ = accepted.await;
+                let _ = tx.send(true);
+            });
+            Ok(Conn {
+                conn,
+                settled: Some(rx),
+            })
+        }
+        // The plaintext session always has early keys; kept as a plain fallback.
+        Err(connecting) => Ok(Conn::established(connecting.await?)),
+    }
+}
+
+/// Writes the tokenless hello and returns without waiting for the reply. The receive
+/// half is handed back so the caller keeps it open.
+async fn anonymous_hello(connection: &Connection) -> Result<RecvStream, HandshakeError> {
+    let (mut send, recv) = connection.open_bi().await.map_err(map_close)?;
+    send.write_all(ANON_HELLO)
+        .await
+        .map_err(|e| HandshakeError::Io(std::io::Error::other(e)))?;
+    send.finish()
+        .map_err(|e| HandshakeError::Io(std::io::Error::other(e)))?;
+    Ok(recv)
+}
+
+pub(crate) fn validate_credentials(
+    token: Option<&str>,
+    config: &ClientConfig,
+) -> Result<(), ConnectError> {
+    config.validate_with_token(token.is_some())?;
+    config.validate()?;
+    match token {
+        Some(token) => validate_token(token),
+        None => Ok(()),
+    }
 }
 
 /// The server's handshake ack is exactly `OK\n`; anything else is a failure.
@@ -354,22 +572,86 @@ async fn handshake(connection: &Connection, token: &str) -> Result<(), Handshake
     }
 }
 
-async fn send_on(conn: &Connection, bytes: &[u8]) -> Result<(), SendError> {
+async fn send_on(conn: &Conn, bytes: &[u8]) -> Result<(), SendError> {
     let mut uni = conn.open_uni().await?;
-    uni.write_all(bytes).await?;
-    uni.finish()?;
-    uni.stopped().await.map_err(quinn::WriteError::from)?;
-    Ok(())
+    let sent = match uni.write_all(bytes).await {
+        Ok(()) => {
+            uni.finish()?;
+            uni.stopped()
+                .await
+                .map(drop)
+                .map_err(quinn::WriteError::from)
+        }
+        Err(e) => Err(e),
+    };
+    match sent {
+        Ok(()) => Ok(()),
+        // The uni path replays on a lost connection anyway; this only names the cause.
+        Err(quinn::WriteError::ZeroRttRejected) => Err(early_failure(conn).into_error()),
+        Err(e) => Err(e.into()),
+    }
 }
 
-async fn send_on_timed(
-    conn: &Connection,
-    bytes: &[u8],
-    timeout: Duration,
-) -> Result<(), SendError> {
+async fn send_on_timed(conn: &Conn, bytes: &[u8], timeout: Duration) -> Result<(), SendError> {
     tokio::time::timeout(timeout, send_on(conn, bytes))
         .await
         .map_err(|_| SendError::Timeout)?
+}
+
+enum Confirm {
+    /// Nothing reached the server: the stream could not be opened, or its early data
+    /// was discarded undelivered.
+    NotSent(SendError),
+    Failed(SendError),
+}
+
+impl Confirm {
+    fn into_error(self) -> SendError {
+        match self {
+            Self::NotSent(e) | Self::Failed(e) => e,
+        }
+    }
+}
+
+async fn confirm_on_timed(conn: &Conn, bytes: &[u8], timeout: Duration) -> Result<(), Confirm> {
+    tokio::time::timeout(timeout, confirm_on(conn, bytes))
+        .await
+        .map_err(|_| Confirm::Failed(SendError::Timeout))?
+}
+
+async fn confirm_on(conn: &Conn, bytes: &[u8]) -> Result<(), Confirm> {
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| Confirm::NotSent(e.into()))?;
+    // A stream-local stop of the upload is not an outcome; the verdict may still follow.
+    match send.write_all(bytes).await {
+        Ok(()) | Err(quinn::WriteError::Stopped(_) | quinn::WriteError::ClosedStream) => {}
+        Err(quinn::WriteError::ZeroRttRejected) => return Err(early_failure(conn)),
+        Err(e) => return Err(Confirm::Failed(e.into())),
+    }
+    let _ = send.finish();
+    // At most 5 bytes are valid; a 6-byte buffer detects any extra byte.
+    let mut buf = [0u8; 6];
+    let mut len = 0;
+    while len < buf.len() {
+        match recv.read(&mut buf[len..]).await {
+            Ok(Some(n)) => len += n,
+            Ok(None) => break,
+            Err(quinn::ReadError::ConnectionLost(e)) => {
+                return Err(Confirm::Failed(SendError::ConnectionLost(e)));
+            }
+            Err(quinn::ReadError::ZeroRttRejected) => return Err(early_failure(conn)),
+            Err(_) => return Err(Confirm::Failed(SendError::Rejected)),
+        }
+    }
+    match &buf[..len] {
+        [0x00] => Ok(()),
+        [0x01, a, b, c, d] => Err(Confirm::Failed(SendError::RateLimited {
+            retry_after: Duration::from_millis(u64::from(u32::from_le_bytes([*a, *b, *c, *d]))),
+        })),
+        _ => Err(Confirm::Failed(SendError::Rejected)),
+    }
 }
 
 fn next_backoff(current: Duration, max: Duration) -> Duration {
@@ -391,7 +673,7 @@ fn jittered(base: Duration) -> Duration {
 }
 
 /// A send failure that warrants a transparent reconnect + retry: a genuinely lost
-/// connection, or a send timeout (which usually means the connection is wedged — a
+/// connection, a send timeout (which usually means the connection is wedged — a
 /// path failure or flow-control stall QUIC has not yet surfaced).
 const fn is_reconnectable_send_error(e: &SendError) -> bool {
     matches!(
@@ -402,6 +684,20 @@ const fn is_reconnectable_send_error(e: &SendError) -> bool {
     )
 }
 
+/// quinn fails every stream opened before establishment with `ZeroRttRejected` when
+/// the connection ends unestablished — whether or not the server already read the
+/// data. Only a version mismatch proves nothing was delivered; otherwise report the
+/// real close reason and never resubmit.
+fn early_failure(conn: &Conn) -> Confirm {
+    match conn.close_reason() {
+        Some(ConnectionError::VersionMismatch) => {
+            Confirm::NotSent(SendError::ConnectionLost(ConnectionError::VersionMismatch))
+        }
+        Some(reason) => Confirm::Failed(SendError::ConnectionLost(reason)),
+        None => Confirm::Failed(quinn::WriteError::ZeroRttRejected.into()),
+    }
+}
+
 /// Reconnection-terminal: token auth failure, a client-side TLS/config error, or a TLS
 /// handshake (crypto) failure such as an untrusted server certificate. Transport
 /// failures (server down, reset, timeout, refused) are transient and retried with backoff.
@@ -410,12 +706,17 @@ const fn is_terminal(e: &ConnectError) -> bool {
         ConnectError::Tls(_) => true,
         ConnectError::Handshake(h) => matches!(
             h,
-            HandshakeError::Unauthorized | HandshakeError::Revoked | HandshakeError::BadRequest
+            HandshakeError::Unauthorized
+                | HandshakeError::Revoked
+                | HandshakeError::BadRequest
+                | HandshakeError::TokenlessUnsupported
         ),
         // TLS handshake (crypto) failure, such as an untrusted server certificate. Other
         // `ConnectionError` variants (Reset / TimedOut / ConnectionClosed / ...) and
         // `ConnectError::Dial` / `Resolve` remain transient.
-        ConnectError::Connection(quinn::ConnectionError::TransportError(_)) => true,
+        ConnectError::Connection(
+            ConnectionError::TransportError(_) | ConnectionError::VersionMismatch,
+        ) => true,
         _ => false,
     }
 }
@@ -506,7 +807,7 @@ mod terminal_tests {
         let config = ClientConfig::default();
         let endpoint = build_endpoint(addr, &config).unwrap();
 
-        let err = dial_and_handshake(&endpoint, addr, "127.0.0.1", "tok")
+        let err = dial_and_handshake(&endpoint, addr, "127.0.0.1", Some("tok"), config.security)
             .await
             .expect_err("handshake must fail on an untrusted certificate");
         assert!(
@@ -570,6 +871,9 @@ mod tests {
             HandshakeError::Revoked
         )));
         assert!(is_terminal(&ConnectError::Tls("bad".into())));
+        assert!(is_terminal(&ConnectError::Connection(
+            ConnectionError::VersionMismatch
+        )));
         assert!(!is_terminal(&ConnectError::Resolve("dns".into())));
         assert!(!is_terminal(&ConnectError::Handshake(
             HandshakeError::TooManyConnections
@@ -591,6 +895,9 @@ mod tests {
     fn timeout_is_reconnectable_but_stream_stop_is_not() {
         // A send timeout means the connection is likely wedged → reconnect.
         assert!(is_reconnectable_send_error(&SendError::Timeout));
+        assert!(!is_reconnectable_send_error(&SendError::StreamWrite(
+            quinn::WriteError::ZeroRttRejected
+        )));
         // Size errors are caller errors, never reconnectable.
         assert!(!is_reconnectable_send_error(&SendError::TooLarge(9999)));
         // A stream-level STOP (incl. the server's 0x10 reset) must NOT reconnect:

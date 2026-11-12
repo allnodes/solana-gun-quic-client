@@ -2,9 +2,23 @@ use std::{sync::Arc, time::Duration};
 
 use crate::error::ConnectError;
 
+/// QUIC transport security. Never chosen automatically.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Security {
+    /// WebPKI-verified TLS 1.3.
+    #[default]
+    VerifiedTls,
+    /// TLS 1.3 that accepts any server certificate (no identity check).
+    SkipVerification,
+    /// No encryption; tokenless connections only.
+    Unencrypted,
+}
+
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
+    pub security: Security,
     /// Extra trust roots for tests; `None` = system roots. Chain + hostname validation always runs.
     pub root_store: Option<Arc<rustls::RootCertStore>>,
     pub idle_timeout: Duration,
@@ -16,6 +30,7 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
+            security: Security::default(),
             root_store: None,
             idle_timeout: Duration::from_secs(30),
             keep_alive_interval: Duration::from_secs(10),
@@ -51,6 +66,16 @@ impl Default for ReconnectPolicy {
 }
 
 impl ClientConfig {
+    /// First check of every connect entry point, before any I/O.
+    pub(crate) fn validate_with_token(&self, has_token: bool) -> Result<(), ConnectError> {
+        if has_token && self.security == Security::Unencrypted {
+            return Err(ConnectError::Config(
+                "authenticated submission without encryption is unsupported".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Validate operational parameters before dialing.
     pub fn validate(&self) -> Result<(), ConnectError> {
         if let Some(roots) = &self.root_store
@@ -98,6 +123,27 @@ impl ClientConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_is_verified_tls() {
+        assert_eq!(ClientConfig::default().security, Security::VerifiedTls);
+    }
+
+    #[test]
+    fn token_with_unencrypted_is_a_config_error() {
+        let mut c = ClientConfig {
+            security: Security::Unencrypted,
+            ..ClientConfig::default()
+        };
+        let e = c.validate_with_token(true).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("authenticated submission without encryption is unsupported")
+        );
+        assert!(c.validate_with_token(false).is_ok());
+        c.security = Security::SkipVerification;
+        assert!(c.validate_with_token(true).is_ok());
+    }
 
     #[test]
     fn validate_rejects_degenerate_config() {
